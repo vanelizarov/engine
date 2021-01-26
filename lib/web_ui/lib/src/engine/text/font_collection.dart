@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// @dart = 2.10
+// @dart = 2.12
 part of engine;
 
 const String _ahemFontFamily = 'Ahem';
@@ -200,6 +200,7 @@ class FontManager {
       // loaded. They were measured using fallback font, so we should clear the
       // cache.
       TextMeasurementService.clearCache();
+      Spanometer.clearRulersCache();
     }, onError: (dynamic exception) {
       // Failures here will throw an html.DomException which confusingly
       // does not implement Exception or Error. Rethrow an Exception so it can

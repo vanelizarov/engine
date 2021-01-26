@@ -26,6 +26,7 @@ import 'safari_installation.dart';
 import 'supported_browsers.dart';
 import 'test_platform.dart';
 import 'utils.dart';
+import 'watcher.dart';
 
 /// The type of tests requested by the tool user.
 enum TestTypesRequested {
@@ -47,6 +48,12 @@ class TestCommand extends Command<bool> with ArgUtils {
         help: 'Pauses the browser before running a test, giving you an '
             'opportunity to add breakpoints or inspect loaded code before '
             'running the code.',
+      )
+      ..addFlag(
+        'watch',
+        abbr: 'w',
+        help: 'Run in watch mode so the tests re-run whenever a change is '
+            'made.',
       )
       ..addFlag(
         'unit-tests-only',
@@ -90,6 +97,8 @@ class TestCommand extends Command<bool> with ArgUtils {
 
     SupportedBrowsers.instance.argParsers
         .forEach((t) => t.populateOptions(argParser));
+    GeneralTestsArgumentParser.instance.populateOptions(argParser);
+    IntegrationTestsArgumentParser.instance.populateOptions(argParser);
   }
 
   @override
@@ -97,6 +106,8 @@ class TestCommand extends Command<bool> with ArgUtils {
 
   @override
   final String description = 'Run tests.';
+
+  bool get isWatchMode => boolArg('watch');
 
   TestTypesRequested testTypesRequested = null;
 
@@ -133,6 +144,7 @@ class TestCommand extends Command<bool> with ArgUtils {
   Future<bool> run() async {
     SupportedBrowsers.instance
       ..argParsers.forEach((t) => t.parseOptions(argResults));
+    GeneralTestsArgumentParser.instance.parseOptions(argResults);
 
     // Check the flags to see what type of integration tests are requested.
     testTypesRequested = findTestType();
@@ -143,29 +155,86 @@ class TestCommand extends Command<bool> with ArgUtils {
       await macOsInfo.printInformation();
     }
 
-    switch (testTypesRequested) {
-      case TestTypesRequested.unit:
-        return runUnitTests();
-      case TestTypesRequested.integration:
-        return runIntegrationTests();
-      case TestTypesRequested.all:
-        if (runAllTests && isIntegrationTestsAvailable) {
-          bool unitTestResult = await runUnitTests();
-          bool integrationTestResult = await runIntegrationTests();
-          if (integrationTestResult != unitTestResult) {
-            print('Tests run. Integration tests passed: $integrationTestResult '
-                'unit tests passed: $unitTestResult');
+    final Pipeline testPipeline = Pipeline(steps: <PipelineStep>[
+      () async => clearTerminalScreen(),
+      () => runTestsOfType(testTypesRequested),
+    ]);
+    await testPipeline.start();
+
+    if (isWatchMode) {
+      final FilePath dir = FilePath.fromWebUi('');
+      print('');
+      print('Initial test run is done!');
+      print('Watching ${dir.relativeToCwd}/lib and ${dir.relativeToCwd}/test to re-run tests');
+      print('');
+      PipelineWatcher(
+        dir: dir.absolute,
+        pipeline: testPipeline,
+        ignore: (event) {
+          // Ignore font files that are copied whenever tests run.
+          if (event.path.endsWith('.ttf')) {
+            return true;
           }
-          return integrationTestResult && unitTestResult;
-        } else {
-          return await runUnitTests();
+
+          // Ignore auto-generated JS files.
+          // The reason we are using `.contains()` instead of `.endsWith()` is
+          // because the auto-generated files could end with any of the
+          // following:
+          //
+          // - browser_test.dart.js
+          // - browser_test.dart.js.map
+          // - browser_test.dart.js.deps
+          if (event.path.contains('browser_test.dart.js')) {
+            return true;
+          }
+
+          // React to changes in lib/ and test/ folders.
+          final String relativePath = path.relative(event.path, from: dir.absolute);
+          if (relativePath.startsWith('lib/') || relativePath.startsWith('test/')) {
+            return false;
+          }
+
+          // Ignore anything else.
+          return true;
         }
+      ).start();
+      // Return a never-ending future.
+      return Completer<bool>().future;
+    } else {
+      return true;
     }
-    return false;
+  }
+
+  Future<bool> runTestsOfType(TestTypesRequested testTypesRequested) async {
+    try {
+      switch (testTypesRequested) {
+        case TestTypesRequested.unit:
+          return runUnitTests();
+        case TestTypesRequested.integration:
+          return runIntegrationTests();
+        case TestTypesRequested.all:
+          if (runAllTests && isIntegrationTestsAvailable) {
+            bool unitTestResult = await runUnitTests();
+            bool integrationTestResult = await runIntegrationTests();
+            if (integrationTestResult != unitTestResult) {
+              print('Tests run. Integration tests passed: $integrationTestResult '
+                  'unit tests passed: $unitTestResult');
+            }
+            return integrationTestResult && unitTestResult;
+          } else {
+            return await runUnitTests();
+          }
+      }
+      throw UnimplementedError('Unknown test type requested: $testTypesRequested');
+    } on TestFailureException {
+      return true;
+    }
   }
 
   Future<bool> runIntegrationTests() async {
-    if(!_testPreparationReady) {
+    // Parse additional arguments specific for integration testing.
+    IntegrationTestsArgumentParser.instance.parseOptions(argResults);
+    if (!_testPreparationReady) {
       await _prepare();
     }
     return IntegrationTestsManager(
@@ -204,7 +273,9 @@ class TestCommand extends Command<bool> with ArgUtils {
 
     // If screenshot tests are available, fetch the screenshot goldens.
     if (isScreenshotTestsAvailable) {
-      print('screenshot tests available');
+      if (isVerboseLoggingEnabled) {
+        print('INFO: Screenshot tests available');
+      }
       final GoldensRepoFetcher goldensRepoFetcher = GoldensRepoFetcher(
           environment.webUiGoldensRepositoryDirectory,
           path.join(environment.webUiDevDir.path, 'goldens_lock.yaml'));
@@ -236,7 +307,7 @@ class TestCommand extends Command<bool> with ArgUtils {
     }
 
     // Separate HTML targets from CanvasKit targets because the two use
-    // different dart2js options (and different build.*.yaml files).
+    // different dart2js options.
     final List<FilePath> htmlTargets = <FilePath>[];
     final List<FilePath> canvasKitTargets = <FilePath>[];
     final String canvasKitTestDirectory =
@@ -429,35 +500,42 @@ class TestCommand extends Command<bool> with ArgUtils {
       'test',
     ));
 
-    if (isUnitTestsScreenshotsAvailable) {
-      // Separate screenshot tests from unit-tests. Screenshot tests must run
-      // one at a time. Otherwise, they will end up screenshotting each other.
-      // This is not an issue for unit-tests.
-      final FilePath failureSmokeTestPath = FilePath.fromWebUi(
-        'test/golden_tests/golden_failure_smoke_test.dart',
-      );
-      final List<FilePath> screenshotTestFiles = <FilePath>[];
-      final List<FilePath> unitTestFiles = <FilePath>[];
+    // Separate screenshot tests from unit-tests. Screenshot tests must run
+    // one at a time. Otherwise, they will end up screenshotting each other.
+    // This is not an issue for unit-tests.
+    final FilePath failureSmokeTestPath = FilePath.fromWebUi(
+      'test/golden_tests/golden_failure_smoke_test.dart',
+    );
+    final List<FilePath> screenshotTestFiles = <FilePath>[];
+    final List<FilePath> unitTestFiles = <FilePath>[];
 
-      for (io.File testFile
-          in testDir.listSync(recursive: true).whereType<io.File>()) {
-        final FilePath testFilePath = FilePath.fromCwd(testFile.path);
-        if (!testFilePath.absolute.endsWith('_test.dart')) {
-          // Not a test file at all. Skip.
-          continue;
-        }
-        if (testFilePath == failureSmokeTestPath) {
-          // A smoke test that fails on purpose. Skip.
-          continue;
-        }
-
-        if (path.split(testFilePath.relativeToWebUi).contains('golden_tests')) {
-          screenshotTestFiles.add(testFilePath);
-        } else {
-          unitTestFiles.add(testFilePath);
-        }
+    for (io.File testFile
+        in testDir.listSync(recursive: true).whereType<io.File>()) {
+      final FilePath testFilePath = FilePath.fromCwd(testFile.path);
+      if (!testFilePath.absolute.endsWith('_test.dart')) {
+        // Not a test file at all. Skip.
+        continue;
+      }
+      if (testFilePath == failureSmokeTestPath) {
+        // A smoke test that fails on purpose. Skip.
+        continue;
       }
 
+      // All files under test/golden_tests are considered golden tests.
+      final bool isUnderGoldenTestsDirectory =
+          path.split(testFilePath.relativeToWebUi).contains('golden_tests');
+      // Any file whose name ends with "_golden_test.dart" is run as a golden test.
+      final bool isGoldenTestFile = path
+          .basename(testFilePath.relativeToWebUi)
+          .endsWith('_golden_test.dart');
+      if (isUnderGoldenTestsDirectory || isGoldenTestFile) {
+        screenshotTestFiles.add(testFilePath);
+      } else {
+        unitTestFiles.add(testFilePath);
+      }
+    }
+
+    if (isUnitTestsScreenshotsAvailable) {
       // This test returns a non-zero exit code on purpose. Run it separately.
       if (io.Platform.environment['CIRRUS_CI'] != 'true') {
         await _runTestBatch(
@@ -467,11 +545,13 @@ class TestCommand extends Command<bool> with ArgUtils {
         );
         _checkExitCode();
       }
+    }
 
-      // Run all unit-tests as a single batch.
-      await _runTestBatch(unitTestFiles, concurrency: 10, expectFailure: false);
-      _checkExitCode();
+    // Run all unit-tests as a single batch.
+    await _runTestBatch(unitTestFiles, concurrency: 10, expectFailure: false);
+    _checkExitCode();
 
+    if (isUnitTestsScreenshotsAvailable) {
       // Run screenshot tests one at a time.
       for (FilePath testFilePath in screenshotTestFiles) {
         await _runTestBatch(
@@ -481,30 +561,17 @@ class TestCommand extends Command<bool> with ArgUtils {
         );
         _checkExitCode();
       }
-    } else {
-      final List<FilePath> unitTestFiles = <FilePath>[];
-      for (io.File testFile
-          in testDir.listSync(recursive: true).whereType<io.File>()) {
-        final FilePath testFilePath = FilePath.fromCwd(testFile.path);
-        if (!testFilePath.absolute.endsWith('_test.dart')) {
-          // Not a test file at all. Skip.
-          continue;
-        }
-        if (!path
-            .split(testFilePath.relativeToWebUi)
-            .contains('golden_tests')) {
-          unitTestFiles.add(testFilePath);
-        }
-      }
-      // Run all unit-tests as a single batch.
-      await _runTestBatch(unitTestFiles, concurrency: 10, expectFailure: false);
-      _checkExitCode();
     }
   }
 
   void _checkExitCode() {
     if (io.exitCode != 0) {
-      throw ToolException('Process exited with exit code ${io.exitCode}.');
+      if (isWatchMode) {
+        io.exitCode = 0;
+        throw TestFailureException();
+      } else {
+        throw ToolException('Process exited with exit code ${io.exitCode}.');
+      }
     }
   }
 
@@ -623,7 +690,13 @@ class TestCommand extends Command<bool> with ArgUtils {
       '--enable-asserts',
       '--enable-experiment=non-nullable',
       '--no-sound-null-safety',
-      if (input.forCanvasKit) '-DFLUTTER_WEB_USE_SKIA=true',
+
+      // We do not want to auto-select a renderer in tests. As of today, tests
+      // are designed to run in one specific mode. So instead, we specify the
+      // renderer explicitly.
+      '-DFLUTTER_WEB_AUTO_DETECT=false',
+      '-DFLUTTER_WEB_USE_SKIA=${input.forCanvasKit}',
+
       '-O2',
       '-o',
       targetFileName, // target path.
@@ -697,7 +770,11 @@ class TestCommand extends Command<bool> with ArgUtils {
   }
 }
 
-const List<String> _kTestFonts = <String>['ahem.ttf', 'Roboto-Regular.ttf'];
+const List<String> _kTestFonts = <String>[
+  'ahem.ttf',
+  'Roboto-Regular.ttf',
+  'NotoNaskhArabic-Regular.ttf',
+];
 
 void _copyTestFontsIntoWebUi() {
   final String fontsPath = path.join(
@@ -728,3 +805,5 @@ class TestBuildInput {
 
   TestBuildInput(this.path, {this.forCanvasKit = false});
 }
+
+class TestFailureException implements Exception {}

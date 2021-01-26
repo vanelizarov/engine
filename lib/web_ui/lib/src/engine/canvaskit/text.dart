@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-// @dart = 2.10
+// @dart = 2.12
 part of engine;
 
 class CkParagraphStyle implements ui.ParagraphStyle {
@@ -62,11 +62,7 @@ class CkParagraphStyle implements ui.ParagraphStyle {
       skTextStyle.fontSize = fontSize;
     }
 
-    if (fontFamily == null ||
-        !skiaFontCollection.registeredFamilies.contains(fontFamily)) {
-      fontFamily = 'Roboto';
-    }
-    skTextStyle.fontFamilies = [fontFamily];
+    skTextStyle.fontFamilies = _getEffectiveFontFamilies(fontFamily);
 
     return skTextStyle;
   }
@@ -74,16 +70,8 @@ class CkParagraphStyle implements ui.ParagraphStyle {
   static SkStrutStyleProperties toSkStrutStyleProperties(ui.StrutStyle value) {
     EngineStrutStyle style = value as EngineStrutStyle;
     final SkStrutStyleProperties skStrutStyle = SkStrutStyleProperties();
-    if (style._fontFamily != null) {
-      final List<String> fontFamilies = <String>[style._fontFamily!];
-      if (style._fontFamilyFallback != null) {
-        fontFamilies.addAll(style._fontFamilyFallback!);
-      }
-      skStrutStyle.fontFamilies = fontFamilies;
-    } else {
-      // If no strut font family is given, default to Roboto.
-      skStrutStyle.fontFamilies = ['Roboto'];
-    }
+    skStrutStyle.fontFamilies =
+        _getEffectiveFontFamilies(style._fontFamily, style._fontFamilyFallback);
 
     if (style._fontSize != null) {
       skStrutStyle.fontSize = style._fontSize;
@@ -275,18 +263,8 @@ class CkTextStyle implements ui.TextStyle {
       properties.locale = locale.toLanguageTag();
     }
 
-    if (fontFamily == null ||
-        !skiaFontCollection.registeredFamilies.contains(fontFamily)) {
-      fontFamily = 'Roboto';
-    }
-
-    List<String> fontFamilies = <String>[fontFamily];
-    if (fontFamilyFallback != null &&
-        !fontFamilyFallback.every((font) => fontFamily == font)) {
-      fontFamilies.addAll(fontFamilyFallback);
-    }
-
-    properties.fontFamilies = fontFamilies;
+    properties.fontFamilies =
+        _getEffectiveFontFamilies(fontFamily, fontFamilyFallback);
 
     if (fontWeight != null || fontStyle != null) {
       properties.fontStyle = toSkFontStyle(fontWeight, fontStyle);
@@ -531,10 +509,10 @@ class CkParagraph extends ManagedSkiaObject<SkParagraph>
     for (int i = 0; i < skRects.length; i++) {
       final List<double> rect = skRects[i];
       result.add(ui.TextBox.fromLTRBD(
-          rect[0],
-          rect[1],
-          rect[2],
-          rect[3],
+        rect[0],
+        rect[1],
+        rect[2],
+        rect[3],
         _paragraphStyle._textDirection!,
       ));
     }
@@ -560,23 +538,12 @@ class CkParagraph extends ManagedSkiaObject<SkParagraph>
 
   @override
   void layout(ui.ParagraphConstraints constraints) {
-    assert(constraints.width != null); // ignore: unnecessary_null_comparison
     _lastLayoutConstraints = constraints;
 
-    // Infinite width breaks layout, just use a very large number instead.
-    // TODO(het): Remove this once https://bugs.chromium.org/p/skia/issues/detail?id=9874
-    //            is fixed.
-    double width;
-    const double largeFiniteWidth = 1000000;
-    if (constraints.width.isInfinite) {
-      width = largeFiniteWidth;
-    } else {
-      width = constraints.width;
-    }
     // TODO(het): CanvasKit throws an exception when laid out with
     // a font that wasn't registered.
     try {
-      skiaObject.layout(width);
+      skiaObject.layout(constraints.width);
     } catch (e) {
       html.window.console.warn('CanvasKit threw an exception while laying '
           'out the paragraph. The font was "${_paragraphStyle._fontFamily}". '
@@ -635,7 +602,7 @@ class CkParagraphBuilder implements ui.ParagraphBuilder {
 
     _placeholderCount++;
     _placeholderScales.add(scale);
-    SkPlaceholderStyleProperties placeholderStyle = toSkPlaceholderStyle(
+    final _CkParagraphPlaceholder placeholderStyle = toSkPlaceholderStyle(
       width * scale,
       height * scale,
       alignment,
@@ -645,35 +612,98 @@ class CkParagraphBuilder implements ui.ParagraphBuilder {
     _addPlaceholder(placeholderStyle);
   }
 
-  void _addPlaceholder(SkPlaceholderStyleProperties placeholderStyle) {
+  void _addPlaceholder(_CkParagraphPlaceholder placeholderStyle) {
     _commands.add(_ParagraphCommand.addPlaceholder(placeholderStyle));
-    _paragraphBuilder.addPlaceholder(placeholderStyle);
+    _paragraphBuilder.addPlaceholder(
+      placeholderStyle.width,
+      placeholderStyle.height,
+      placeholderStyle.alignment,
+      placeholderStyle.baseline,
+      placeholderStyle.offset,
+    );
   }
 
-  static SkPlaceholderStyleProperties toSkPlaceholderStyle(
+  static _CkParagraphPlaceholder toSkPlaceholderStyle(
     double width,
     double height,
     ui.PlaceholderAlignment alignment,
     double baselineOffset,
     ui.TextBaseline baseline,
   ) {
-    final properties = SkPlaceholderStyleProperties();
-    properties.width = width;
-    properties.height = height;
-    properties.alignment = toSkPlaceholderAlignment(alignment);
-    properties.offset = baselineOffset;
-    properties.baseline = toSkTextBaseline(baseline);
+    final properties = _CkParagraphPlaceholder(
+      width: width,
+      height: height,
+      alignment: toSkPlaceholderAlignment(alignment),
+      offset: baselineOffset,
+      baseline: toSkTextBaseline(baseline),
+    );
     return properties;
+  }
+
+  /// Determines if the given [text] contains any code points which are not
+  /// supported by the current set of fonts.
+  void _ensureFontsSupportText(String text) {
+    // TODO(hterkelsen): Make this faster for the common case where the text
+    // is supported by the given fonts.
+
+    // If the text is ASCII, then skip this check.
+    bool isAscii = true;
+    for (int i = 0; i < text.length; i++) {
+      if (text.codeUnitAt(i) >= 160) {
+        isAscii = false;
+        break;
+      }
+    }
+    if (isAscii) {
+      return;
+    }
+    CkTextStyle style = _peekStyle();
+    List<String> fontFamilies =
+        _getEffectiveFontFamilies(style.fontFamily, style.fontFamilyFallback);
+    List<SkTypeface> typefaces = <SkTypeface>[];
+    for (var font in fontFamilies) {
+      List<SkTypeface>? typefacesForFamily =
+          skiaFontCollection.familyToTypefaceMap[font];
+      if (typefacesForFamily != null) {
+        typefaces.addAll(typefacesForFamily);
+      }
+    }
+    List<bool> codeUnitsSupported = List<bool>.filled(text.length, false);
+    for (SkTypeface typeface in typefaces) {
+      SkFont font = SkFont(typeface);
+      Uint8List glyphs = font.getGlyphIDs(text);
+      assert(glyphs.length == codeUnitsSupported.length);
+      for (int i = 0; i < glyphs.length; i++) {
+        codeUnitsSupported[i] |=
+            glyphs[i] != 0 || _isControlCode(text.codeUnitAt(i));
+      }
+    }
+
+    if (codeUnitsSupported.any((x) => !x)) {
+      List<int> missingCodeUnits = <int>[];
+      for (int i = 0; i < codeUnitsSupported.length; i++) {
+        if (!codeUnitsSupported[i]) {
+          missingCodeUnits.add(text.codeUnitAt(i));
+        }
+      }
+      _findFontsForMissingCodeunits(missingCodeUnits);
+    }
+  }
+
+  /// Returns [true] if [codepoint] is a Unicode control code.
+  bool _isControlCode(int codepoint) {
+    return codepoint < 32 || (codepoint > 127 && codepoint < 160);
   }
 
   @override
   void addText(String text) {
+    _ensureFontsSupportText(text);
     _commands.add(_ParagraphCommand.addText(text));
     _paragraphBuilder.addText(text);
   }
 
   @override
-  ui.Paragraph build() {
+  CkParagraph build() {
     final builtParagraph = _buildCkParagraph();
     return CkParagraph(builtParagraph, _style, _commands);
   }
@@ -701,6 +731,15 @@ class CkParagraphBuilder implements ui.ParagraphBuilder {
   CkTextStyle _peekStyle() =>
       _styleStack.isEmpty ? _style.getTextStyle() : _styleStack.last;
 
+  // Used as the paint for background or foreground in the text style when
+  // the other one is not specified. CanvasKit either both background and
+  // foreground paints specified, or neither, but Flutter allows one of them
+  // to go unspecified.
+  //
+  // This object is never deleted. It is effectively a static global constant.
+  // Therefore it doesn't need to be wrapped in CkPaint.
+  static final SkPaint _defaultTextStylePaint = SkPaint();
+
   @override
   void pushStyle(ui.TextStyle style) {
     final CkTextStyle baseStyle = _peekStyle();
@@ -709,8 +748,10 @@ class CkParagraphBuilder implements ui.ParagraphBuilder {
     _styleStack.add(skStyle);
     _commands.add(_ParagraphCommand.pushStyle(ckStyle));
     if (skStyle.foreground != null || skStyle.background != null) {
-      final SkPaint foreground = skStyle.foreground?.skiaObject ?? SkPaint();
-      final SkPaint background = skStyle.background?.skiaObject ?? SkPaint();
+      final SkPaint foreground =
+          skStyle.foreground?.skiaObject ?? _defaultTextStylePaint;
+      final SkPaint background =
+          skStyle.background?.skiaObject ?? _defaultTextStylePaint;
       _paragraphBuilder.pushPaintStyle(
           skStyle.skTextStyle, foreground, background);
     } else {
@@ -719,11 +760,27 @@ class CkParagraphBuilder implements ui.ParagraphBuilder {
   }
 }
 
+class _CkParagraphPlaceholder {
+  _CkParagraphPlaceholder({
+    required this.width,
+    required this.height,
+    required this.alignment,
+    required this.baseline,
+    required this.offset,
+  });
+
+  final double width;
+  final double height;
+  final SkPlaceholderAlignment alignment;
+  final SkTextBaseline baseline;
+  final double offset;
+}
+
 class _ParagraphCommand {
   final _ParagraphCommandType type;
   final String? text;
   final CkTextStyle? style;
-  final SkPlaceholderStyleProperties? placeholderStyle;
+  final _CkParagraphPlaceholder? placeholderStyle;
 
   const _ParagraphCommand._(
     this.type,
@@ -742,7 +799,7 @@ class _ParagraphCommand {
       : this._(_ParagraphCommandType.pushStyle, null, style, null);
 
   const _ParagraphCommand.addPlaceholder(
-      SkPlaceholderStyleProperties placeholderStyle)
+      _CkParagraphPlaceholder placeholderStyle)
       : this._(
             _ParagraphCommandType.addPlaceholder, null, null, placeholderStyle);
 }
@@ -752,4 +809,18 @@ enum _ParagraphCommandType {
   pop,
   pushStyle,
   addPlaceholder,
+}
+
+List<String> _getEffectiveFontFamilies(String? fontFamily,
+    [List<String>? fontFamilyFallback]) {
+  List<String> fontFamilies = <String>[];
+  if (fontFamily != null) {
+    fontFamilies.add(fontFamily);
+  }
+  if (fontFamilyFallback != null &&
+      !fontFamilyFallback.every((font) => fontFamily == font)) {
+    fontFamilies.addAll(fontFamilyFallback);
+  }
+  fontFamilies.addAll(skiaFontCollection.globalFontFallbacks);
+  return fontFamilies;
 }

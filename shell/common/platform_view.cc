@@ -136,6 +136,13 @@ std::unique_ptr<Surface> PlatformView::CreateRenderingSurface() {
   return nullptr;
 }
 
+std::shared_ptr<ExternalViewEmbedder>
+PlatformView::CreateExternalViewEmbedder() {
+  FML_DLOG(WARNING)
+      << "This platform doesn't support embedding external views.";
+  return nullptr;
+}
+
 void PlatformView::SetNextFrameCallback(const fml::closure& closure) {
   if (!closure) {
     return;
@@ -150,6 +157,23 @@ PlatformView::ComputePlatformResolvedLocales(
   std::unique_ptr<std::vector<std::string>> out =
       std::make_unique<std::vector<std::string>>();
   return out;
+}
+
+void PlatformView::RequestDartDeferredLibrary(intptr_t loading_unit_id) {}
+
+void PlatformView::LoadDartDeferredLibrary(
+    intptr_t loading_unit_id,
+    std::unique_ptr<const fml::Mapping> snapshot_data,
+    std::unique_ptr<const fml::Mapping> snapshot_instructions) {}
+
+void PlatformView::LoadDartDeferredLibraryError(intptr_t loading_unit_id,
+                                                const std::string error_message,
+                                                bool transient) {}
+
+void PlatformView::UpdateAssetResolverByType(
+    std::unique_ptr<AssetResolver> updated_asset_resolver,
+    AssetResolver::AssetResolverType type) {
+  delegate_.UpdateAssetResolverByType(std::move(updated_asset_resolver), type);
 }
 
 }  // namespace flutter
